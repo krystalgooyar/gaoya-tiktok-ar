@@ -75,6 +75,8 @@ const clamp = (n,a,b) => Math.min(b,Math.max(a,n));
 let width, height, stream, tracker, face, lastVideo = -1, lastTrack = 0;
 const expressionHoldMs = parameter('holdMs', 105, 3000);
 const laughHoldMs = parameter('laughHoldMs', 230, 3000);
+const laughReleaseMs = 500;
+let lastLaughAt = 0;
 const smileHoldMs = parameter('smileHoldMs', 48, 3000);
 const switchCooldownMs = parameter('cooldownMs', 250, 3000);
 let mood = 'neutral', candidate = mood, since = 0, smile = 0, jaw = 0;
@@ -164,6 +166,7 @@ function resetExpression() {
   mouthDirection = speechUntil = 0;
   lastMouthTurn = -Infinity;
   since = moodSince = cooldownUntil = 0;
+  lastLaughAt = 0;
 }
 
 function stop() {
@@ -379,13 +382,15 @@ function updateExpression(now, rawLeft, rawRight, rawJaw, roundedLips) {
     && bilateralSmile >= (holdingFire ? .12 : .21);
   const speech = now < speechUntil;
   const laughing = openMouth && laughSmile && (!speech || (smile >= .50 && bilateralSmile >= .34));
+  if (laughing) lastLaughAt = now;
   const smiling = smile > (mood === 'rain' ? expression.smileExit : expression.smileEnter);
   const next = laughing ? 'fire' : speech ? 'speech' : smiling ? 'rain' : 'neutral';
   if (!moodSince) moodSince = now;
   if (next !== candidate) { candidate = next; since = now; }
   const holdMs = candidate === 'fire' ? laughHoldMs
     : candidate === 'rain' && mood === 'neutral' ? smileHoldMs : expressionHoldMs;
-  if (mood !== candidate && now - since >= holdMs && now >= cooldownUntil) {
+  const ready = holdingFire ? now - lastLaughAt >= laughReleaseMs : now - since >= holdMs;
+  if (mood !== candidate && ready && now >= cooldownUntil) {
     mood = candidate;
     moodSince = now;
     cooldownUntil = now + switchCooldownMs;
@@ -750,11 +755,10 @@ async function init() {
         dots.add(x, y, whiteSpark, charge * .82, 4 + charge * 5);
       }
     }
-    if(mode==='fire' && now>=nextBurst){volley(now);nextBurst=now+2780;}
+    if(mode==='fire' && candidate==='fire' && now>=nextBurst){volley(now);nextBurst=now+2780;}
     if(mode!=='fire') nextBurst=0;
     let queued = 0;
     for (const rocket of bursts) {
-      if (!rocket.launched && mode !== 'fire') continue;
       if (now < rocket.start) {
         bursts[queued++] = rocket;
         continue;
