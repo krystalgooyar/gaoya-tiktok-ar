@@ -61,10 +61,10 @@ function parameter(name, fallback, maximum = 1) {
 }
 
 const expression = {
-  smileEnter: parameter('smileEnter', .35),
-  smileExit: parameter('smileExit', .29),
-  laughSmileEnter: parameter('laughSmileEnter', .22),
-  laughSmileExit: parameter('laughSmileExit', .15),
+  smileEnter: parameter('smileEnter', .32),
+  smileExit: parameter('smileExit', .26),
+  laughSmileEnter: parameter('laughSmileEnter', .34),
+  laughSmileExit: parameter('laughSmileExit', .24),
   jawEnter: parameter('jawEnter', .23),
   jawExit: parameter('jawExit', .16),
   lipEnter: parameter('lipEnter', .25),
@@ -74,21 +74,62 @@ const rand = (a,b) => a + Math.random() * (b-a);
 const clamp = (n,a,b) => Math.min(b,Math.max(a,n));
 let width, height, stream, tracker, face, lastVideo = -1, lastTrack = 0;
 const expressionHoldMs = parameter('holdMs', 105, 3000);
+const laughHoldMs = parameter('laughHoldMs', 230, 3000);
 const smileHoldMs = parameter('smileHoldMs', 48, 3000);
 const switchCooldownMs = parameter('cooldownMs', 250, 3000);
 let mood = 'neutral', candidate = mood, since = 0, smile = 0, jaw = 0;
+let mouthSample, mouthDirection = 0, lastMouthTurn = -Infinity, speechUntil = 0;
 let moodSince = 0, cooldownUntil = 0, opening = 0;
 const rainLayers = [
-  { weight: .34, speed: 270, length: .067, opacity: .22, width: 0, tint: .48 },
-  { weight: .39, speed: 410, length: .13, opacity: .49, width: 0, tint: .68 },
-  { speed: 580, length: .24, opacity: .74, width: 1.25, tint: .92 },
+  { weight: .34, speed: 270, length: .067, opacity: .32, width: 1.35, tint: .48 },
+  { weight: .39, speed: 410, length: .13, opacity: .60, width: 2.6, tint: .68 },
+  { speed: 580, length: .24, opacity: .88, width: 4.4, tint: .92 },
 ];
+const wetMarks = [];
+const wetMarkLimit = 12;
+const wetTrailSteps = 20;
+let nextWetMark = 0;
+const waterHighlight = { color: [.62, .82, 1], tint: .6 };
+
+// Landmark-centered relief: horizontal and vertical reach in face radii.
+const runoffFeatures = [
+  [105, .30, .17, .08], [334, .30, .17, .08], // brow ridges
+  [159, .29, .19, .10], [386, .29, .19, .10], // eye area
+  [1, .32, .25, .15],                         // nose
+  [50, .36, .24, .10], [280, .36, .24, .10],   // cheekbones
+  [61, .23, .17, .07], [291, .23, .17, .07],   // mouth corners
+];
+
+function runoffOffset(u, v, features) {
+  let offset = 0;
+  for (const feature of features) {
+    const dx = (u - feature.u) / feature.reachX;
+    const dy = (v - feature.v) / feature.reachY;
+    const influence = 1 - dx * dx - dy * dy;
+    if (influence > 0) offset += feature.strength * Math.tanh(dx * 3) * influence ** 2;
+  }
+  return clamp(offset, -.16, .16);
+}
+
+function leaveWetMark(x, y, nx, ny, drop) {
+  const now = performance.now();
+  if (now < nextWetMark || wetMarks.length >= wetMarkLimit) return;
+  nextWetMark = now + 220;
+  const u = (x - face.x) / face.rx;
+  wetMarks.push({
+    u, v: (y - face.y) / face.ry,
+    color: drop.color, tint: drop.layer.tint, layer: drop.layer,
+    bend: rand(.008, .022) * (Math.random() < .5 ? -1 : 1),
+    phase: rand(0, Math.PI * 2), trailLength: rand(.30, .78),
+    flow: rand(.8, 1.25), age: 0,
+  });
+}
 let nextBurst = 0, rainCarry = 0, rainStrength = 0;
 let particles = [], bursts = [];
 const limit = 3600, tail = 24, rocketLimit = 24;
 
 const expressionPanel = debugExpression ? $('expression-debug') : null;
-const expressionLabels = { neutral: 'NEUTRAL', rain: 'SMILE', fire: 'LAUGH' };
+const expressionLabels = { neutral: 'NEUTRAL', rain: 'SMILE', fire: 'LAUGH', speech: '疑似说话' };
 const expressionFields = expressionPanel ? Object.fromEntries([
   'smile-meter', 'smile-score', 'jaw-meter', 'jaw-score', 'lip-opening',
   'expression-raw', 'expression-gates', 'expression-state', 'expression-duration', 'expression-candidate', 'expression-cooldown',
@@ -119,6 +160,9 @@ function resetExpression() {
   lookUpLatched = false;
   mood = candidate = 'neutral';
   smile = jaw = opening = 0;
+  mouthSample = undefined;
+  mouthDirection = speechUntil = 0;
+  lastMouthTurn = -Infinity;
   since = moodSince = cooldownUntil = 0;
 }
 
@@ -142,7 +186,8 @@ function stop() {
   updateExpressionDebug(performance.now());
   toggle.textContent = '开启相机';
   hint.textContent = '';
-  particles.length = bursts.length = 0;
+  particles.length = bursts.length = wetMarks.length = 0;
+  nextWetMark = 0;
   for (const point of contacts) point.until = 0;
   nextBurst = rainCarry = rainStrength = nextImpact = 0;
 }
@@ -288,27 +333,58 @@ function track(now) {
   const ry = Math.max(20, Math.hypot(top[0]-chin[0],top[1]-chin[1])*.65);
   face = {x:(top[0]+chin[0])/2, y:(top[1]+chin[1])/2-ry*.14, rx, ry};
   face.hull = forceEllipse ? null : buildFaceHull(ovalIndices.map(map));
+  if (mood === 'rain' || wetMarks.length) {
+    face.runoff = [];
+    for (const [index, reachX, reachY, strength] of runoffFeatures) {
+      const [x, y] = map(index);
+      if (Number.isFinite(x) && Number.isFinite(y)) {
+        face.runoff.push({ u: (x - face.x) / rx, v: (y - face.y) / ry, reachX, reachY, strength });
+      }
+    }
+  }
   const scores = Object.fromEntries((result.faceBlendshapes[0]?.categories ?? []).map(c => [c.categoryName,c.score]));
   const rawLeft = scores.mouthSmileLeft || 0;
   const rawRight = scores.mouthSmileRight || 0;
   const rawJaw = scores.jawOpen || 0;
-  smile += ((rawLeft + rawRight) / 2 - smile) * .43;
-  jaw += (rawJaw - jaw) * .43;
   // Mouth geometry backs up the jaw score when an open smile lowers that score.
   const upperLip = map(13), lowerLip = map(14);
   const leftCorner = map(61), rightCorner = map(291);
   const mouthWidth = Math.hypot(leftCorner[0] - rightCorner[0], leftCorner[1] - rightCorner[1]);
   const lipGap = Math.hypot(upperLip[0] - lowerLip[0], upperLip[1] - lowerLip[1]);
   opening = lipGap / Math.max(1, mouthWidth);
+  updateExpression(now, rawLeft, rawRight, rawJaw, Math.max(scores.mouthFunnel || 0, scores.mouthPucker || 0));
+  if (referenceLook) updateHeadGestures(now, result.facialTransformationMatrixes?.[0]?.data);
+}
+
+function updateExpression(now, rawLeft, rawRight, rawJaw, roundedLips) {
+  smile += ((rawLeft + rawRight) / 2 - smile) * .43;
+  jaw += (rawJaw - jaw) * .43;
+  // Look for repeated opening and closing, with lip rounding as supporting evidence.
+  const mouth = Math.max(rawJaw, opening * .8);
+  const change = mouth - (mouthSample ?? mouth);
+  mouthSample = mouth;
+  if (Math.abs(change) >= .065) {
+    const direction = Math.sign(change);
+    if (mouthDirection && direction !== mouthDirection) {
+      if (now - lastMouthTurn <= 400 || roundedLips >= .27) speechUntil = now + 360;
+      lastMouthTurn = now;
+    }
+    mouthDirection = direction;
+  }
   const holdingFire = mood === 'fire';
   const openMouth = jaw > (holdingFire ? expression.jawExit : expression.jawEnter) ||
     opening > (holdingFire ? expression.lipExit : expression.lipEnter);
-  const laughSmile = smile > (holdingFire ? expression.laughSmileExit : expression.laughSmileEnter);
-  const laughing = openMouth && laughSmile;
-  const next = laughing ? 'fire' : smile > (mood === 'rain' ? expression.smileExit : expression.smileEnter) ? 'rain' : 'neutral';
+  const bilateralSmile = Math.min(rawLeft, rawRight);
+  const laughSmile = smile > (holdingFire ? expression.laughSmileExit : expression.laughSmileEnter)
+    && bilateralSmile >= (holdingFire ? .12 : .21);
+  const speech = now < speechUntil;
+  const laughing = openMouth && laughSmile && (!speech || (smile >= .50 && bilateralSmile >= .34));
+  const smiling = smile > (mood === 'rain' ? expression.smileExit : expression.smileEnter);
+  const next = laughing ? 'fire' : speech ? 'speech' : smiling ? 'rain' : 'neutral';
   if (!moodSince) moodSince = now;
   if (next !== candidate) { candidate = next; since = now; }
-  const holdMs = candidate === 'rain' && mood === 'neutral' ? smileHoldMs : expressionHoldMs;
+  const holdMs = candidate === 'fire' ? laughHoldMs
+    : candidate === 'rain' && mood === 'neutral' ? smileHoldMs : expressionHoldMs;
   if (mood !== candidate && now - since >= holdMs && now >= cooldownUntil) {
     mood = candidate;
     moodSince = now;
@@ -317,8 +393,7 @@ function track(now) {
       nextBurst = 0;
     }
   }
-  if (referenceLook) updateHeadGestures(now, result.facialTransformationMatrixes?.[0]?.data);
-  if (debugExpression) updateExpressionDebug(now, [rawLeft, rawRight, rawJaw], [openMouth, laughSmile]);
+  if (debugExpression) updateExpressionDebug(now, [rawLeft, rawRight, rawJaw], [openMouth, laughSmile, speech]);
 }
 
 function spawn(x,y,vx,vy,life,kind,tint,size) {
@@ -459,7 +534,7 @@ function bounce(p,h,ox,oy,contact) {
   if(dot<0){
     p.vx-=1.68*dot*nx;p.vy-=1.68*dot*ny;
     p.tint=Math.min(1,p.tint+.35);
-    contact?.(h.x + surfaceX * h.rx, h.y + surfaceY * h.ry, nx, ny);
+    contact?.(h.x + surfaceX * h.rx, h.y + surfaceY * h.ry, nx, ny, p);
     return true;
   }
 }
@@ -488,13 +563,13 @@ async function init() {
   video.addEventListener('resize', resize);
   resize();
   toggle.disabled = false;
-  function batch(count, points, debug = false) {
+  function batch(count, points, debug = false, triangles = false) {
     const geometry = new T.BufferGeometry();
     for(const [name,size] of [['position',3],['ink',4],['size',1]]) {
       geometry.setAttribute(name,new T.BufferAttribute(new Float32Array(count*size),size).setUsage(T.DynamicDrawUsage));
     }
     const material = new T.ShaderMaterial({
-      transparent:true,depthTest:false,depthWrite:false,blending:debug ? T.NormalBlending : T.AdditiveBlending,
+      transparent:true,depthTest:false,depthWrite:false,side:triangles ? T.DoubleSide : T.FrontSide,forceSinglePass:triangles,blending:debug ? T.NormalBlending : T.AdditiveBlending,
       vertexShader:`attribute vec4 ink; attribute float size; varying vec4 vInk;
         void main(){ vInk=ink; gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.); gl_PointSize=size*${density.toFixed(3)}; }`,
       fragmentShader:`varying vec4 vInk; void main(){
@@ -502,7 +577,8 @@ async function init() {
         ${points ? 'float r=length(gl_PointCoord-.5)*2.; alpha*=pow(max(0.,1.-r),2.);' : ''}
         gl_FragColor=vec4(vInk.rgb,alpha); }`
     });
-    const item = points ? new T.Points(geometry,material) : new T.LineSegments(geometry,material);
+    const item = triangles ? new T.Mesh(geometry, material)
+      : points ? new T.Points(geometry, material) : new T.LineSegments(geometry, material);
     item.frustumCulled=false;
     if (debug) item.renderOrder = 1;
     scene.add(item);
@@ -540,6 +616,90 @@ async function init() {
   }
   const lines=batch(limit * (tail - 1 + 12 + 4) * 2 + rocketLimit * 2, false),
     dots = batch(limit * 3 + rocketLimit + 9, true);
+  const rainRibbons = batch(limit * 3 + wetMarkLimit * wetTrailSteps * 6, false, false, true);
+  const waterBeads = batch(limit * 2 + wetMarkLimit * 3, true);
+
+  function taperedWater(x, y, endX, endY, width, color, alpha) {
+    const dx = endX - x, dy = endY - y;
+    const scale = width / Math.max(.01, Math.hypot(dx, dy));
+    rainRibbons.add(x, y, color, 0);
+    rainRibbons.add(endX - dy * scale, endY + dx * scale, color, alpha);
+    rainRibbons.add(endX + dy * scale, endY - dx * scale, color, alpha);
+  }
+
+  function drawWaterBead(x, y, drop, alpha) {
+    waterBeads.add(x, y, drop, alpha, drop.layer.width * 2.8);
+    waterBeads.add(x, y, waterHighlight, alpha * .72, drop.layer.width * 1.45);
+  }
+
+  function drawWetMarks(dt) {
+    if (!face) {
+      wetMarks.length = 0;
+      return;
+    }
+    let kept = 0;
+    for (const mark of wetMarks) {
+      mark.age += dt;
+      const fade = clamp((mark.flow + .92 - mark.age) / .92, 0, 1);
+      if (!fade) continue;
+      wetMarks[kept++] = mark;
+      const travel = clamp(mark.age / mark.flow, 0, 1) ** 1.35;
+      // Outer drops leave the cheek sooner, while inner drops reach the jaw.
+      const endV = Math.max(mark.v + .08, .76 * Math.sqrt(1 - Math.min(.98, Math.abs(mark.u)) ** 2));
+      // The older end recedes as the bead advances, leaving trails of different lengths.
+      const tailStart = Math.max(0, travel - mark.trailLength);
+      const features = face.runoff ?? [];
+      const startOffset = runoffOffset(mark.u, mark.v, features);
+      let x, y;
+      let halfWidth = 0, alpha = 0;
+      for (let step = 0; step <= wetTrailSteps; step++) {
+        const along = step / wetTrailSteps;
+        const t = tailStart + (travel - tailStart) * along;
+        const bend = mark.bend * Math.sin(t * Math.PI * 1.7)
+          + .024 * Math.sin(t * Math.PI) * Math.sin(t * 10 + mark.phase);
+        const v = mark.v + (endV - mark.v) * t;
+        const relief = runoffOffset(mark.u, v, features) - startOffset * Math.max(0, 1 - t * 8);
+        const nextX = face.x + (mark.u + bend + relief) * face.rx;
+        const nextY = face.y + v * face.ry;
+        const taper = Math.sin(along * Math.PI * .5);
+        const swell = .5 + .5 * Math.sin(t * 21 + mark.phase);
+        const nextWidth = mark.layer.width * taper * (.23 + .32 * swell);
+        const nextAlpha = mark.layer.opacity * fade * Math.min(1, along * 5)
+          * (.56 + .28 * swell);
+        if (step === 0) {
+          x = nextX;
+          y = nextY;
+          continue;
+        }
+        rainRibbons.add(x - halfWidth, y, mark, alpha);
+        rainRibbons.add(x + halfWidth, y, mark, alpha * .36);
+        rainRibbons.add(nextX - nextWidth, nextY, mark, nextAlpha);
+        rainRibbons.add(x + halfWidth, y, mark, alpha * .36);
+        rainRibbons.add(nextX + nextWidth, nextY, mark, nextAlpha * .36);
+        rainRibbons.add(nextX - nextWidth, nextY, mark, nextAlpha);
+        halfWidth = nextWidth;
+        alpha = nextAlpha;
+        x = nextX;
+        y = nextY;
+      }
+      if (travel < 1) {
+        drawWaterBead(x, y, mark, mark.layer.opacity * fade);
+      } else {
+        if (mark.age - dt < mark.flow) {
+          mark.releaseX = x;
+          mark.releaseY = y;
+        }
+        const fall = mark.age - mark.flow;
+        if (mark.releaseX !== undefined) {
+          const dropX = mark.releaseX;
+          const dropY = mark.releaseY + fall * (65 + 270 * fall);
+          drawWaterBead(dropX, dropY, mark, mark.layer.opacity * fade);
+        }
+      }
+    }
+    wetMarks.length = kept;
+  }
+
   const debugLines = debugCollision ? batch(2 * (48 + contacts.length * 3), false, true) : null;
   const hullColor = [.1, 1, .5], ellipseColor = [1, .63, .1], hitColor = [1, .12, .12];
   function drawCollisionDebug(now) {
@@ -717,14 +877,14 @@ async function init() {
         const wind = Math.sin(now * .0015 + p.tint * 4) * (5 + p.tint * 11);
         p.x += (p.vx + wind) * dt;
         p.y += p.vy * dt;
-        if (face && rainStrength > .08 && bounce(p, face, oldX, oldY)) {
+        if (face && rainStrength > .08 && bounce(p, face, oldX, oldY, leaveWetMark)) {
           kept--;
           spawn(p.x, p.y, p.vx * .18 + rand(-26, 26), -rand(18, 42),
             rand(.12, .22), 'splash', rand(.65, 1), rand(.8, 1.2));
           continue;
         }
         const floor = height - 2;
-        if (p.layer.width && rainStrength > .15 && oldY < floor && p.y >= floor && Math.random() < .34) {
+        if (p.layer === rainLayers[2] && rainStrength > .15 && oldY < floor && p.y >= floor && Math.random() < .34) {
           const hitX = oldX + (p.x - oldX) * (floor - oldY) / (p.y - oldY);
           if (hitX >= 0 && hitX <= width) {
             for (const side of [-1, 1]) {
@@ -733,29 +893,12 @@ async function init() {
             }
           }
         }
-        // Draw a tapered streak directly so its length is independent of frame rate.
         const length = p.size;
         const drift = length * (p.vx + wind) / p.vy;
         const alpha = p.layer.opacity * rainStrength * clamp(p.life * 8, 0, 1);
-        const nearTipX = p.x - drift * .16;
-        const nearTipY = p.y - length * .16;
-        lines.add(p.x - drift, p.y - length, p, 0);
-        lines.add(nearTipX, nearTipY, p, alpha);
-        lines.add(nearTipX, nearTipY, p, alpha);
-        lines.add(p.x, p.y, p, 0);
-        if (p.layer.width) {
-          if (referenceLook) {
-            dots.add(p.x, p.y - 2, p, alpha * .78, 6);
-            dots.add(p.x, p.y - 2, whiteSpark, alpha * .58, 2.6);
-          }
-          for (let side = -1; side <= 1; side += 2) {
-            const offset = side * p.layer.width;
-            lines.add(p.x - drift, p.y - length, p, 0);
-            lines.add(nearTipX + offset, nearTipY, p, alpha * .55);
-            lines.add(nearTipX + offset, nearTipY, p, alpha * .55);
-            lines.add(p.x, p.y, p, 0);
-          }
-        }
+        taperedWater(p.x - drift, p.y - length, p.x, p.y,
+          p.layer.width * .5, p, alpha);
+        drawWaterBead(p.x, p.y, p, alpha);
         continue;
       }
       const ox=p.x,oy=p.y;
@@ -826,6 +969,9 @@ async function init() {
       dots.add(p.x, p.y, p.kind === 'fire' ? whiteSpark : p, fade * .97, p.size * 2.15);
     }
     particles.length=kept;
+    drawWetMarks(dt);
+    rainRibbons.flush();
+    waterBeads.flush();
     lines.flush();dots.flush();
     if (debugLines) drawCollisionDebug(now);
     renderer.render(scene,camera);
