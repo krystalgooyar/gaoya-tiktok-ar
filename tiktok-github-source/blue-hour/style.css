@@ -1,0 +1,131 @@
+:root {
+  color-scheme: dark;
+  font: 14px/1.5 system-ui, sans-serif;
+  background: #000;
+  color: #fff;
+}
+
+body {
+  margin: 0;
+}
+
+#stage {
+  position: relative;
+  height: 100svh;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+}
+
+#camera,
+#effects {
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  pointer-events: none;
+}
+
+#camera {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  transform: scaleX(-1);
+}
+
+.camera-controls {
+  position: relative;
+  text-align: center;
+  padding: 0 16px;
+}
+
+.live .camera-controls {
+  position: absolute;
+  bottom: max(12px, env(safe-area-inset-bottom));
+}
+
+button {
+  min-height: 44px;
+  padding: 0 14px;
+  border: 0;
+  border-radius: 6px;
+  background: #222;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+.live button {
+  background: #000a;
+  color: #ddd;
+  font-size: 12px;
+}
+
+button:disabled {
+  opacity: .65;
+  cursor: wait;
+}
+
+button:focus-visible {
+  outline: 2px solid #fff;
+  outline-offset: 3px;
+}
+
+#hint {
+  margin: 12px 0 0;
+}
+
+#hint:empty {
+  display: none;
+}
+
+#expression-debug {
+  position: absolute;
+  z-index: 1;
+  top: max(12px, env(safe-area-inset-top));
+  right: 12px;
+  width: min(260px, calc(100% - 48px));
+  padding: 10px 12px;
+  border: 1px solid #ffffff38;
+  border-radius: 10px;
+  background: #111a;
+  color: #fff;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+}
+
+.debug-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+#expression-debug meter {
+  display: block;
+  width: 100%;
+  height: 9px;
+}
+
+#smile-meter::-webkit-meter-optimum-value { background: #27c6ad; }
+#jaw-meter::-webkit-meter-optimum-value { background: #f3ac53; }
+#smile-meter::-moz-meter-bar { background: #27c6ad; }
+#jaw-meter::-moz-meter-bar { background: #f3ac53; }
+#expression-state { color: #9ef5d7; }
+
+#performance-debug {
+  position: absolute;
+  z-index: 1;
+  top: max(12px, env(safe-area-inset-top));
+  left: 12px;
+  padding: 5px 8px;
+  border-radius: 6px;
+  background: #111c;
+  font: 12px/1.5 system-ui, sans-serif;
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+}
+
+#stage:has(#performance-debug:not([hidden])) #expression-debug {
+  top: calc(max(12px, env(safe-area-inset-top)) + 34px);
+}
