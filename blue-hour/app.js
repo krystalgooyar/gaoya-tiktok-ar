@@ -52,6 +52,7 @@ performancePanel.hidden = !debugPerformance;
 const idlePerformance = performancePanel.textContent;
 let startRendering, stopRendering;
 let cameraAttempt = 0;
+const trackerLoadTimeoutMs = 30000;
 
 function parameter(name, fallback, maximum = 1) {
   const raw = options.get(name);
@@ -188,6 +189,7 @@ function stop() {
   lastVideo = -1;
   updateExpressionDebug(performance.now());
   toggle.textContent = '开启相机';
+  toggle.disabled = false;
   hint.textContent = '';
   particles.length = bursts.length = wetMarks.length = 0;
   nextWetMark = 0;
@@ -202,6 +204,7 @@ toggle.onclick = async () => {
   hint.textContent = '';
   const attempt = ++cameraAttempt;
   let step = 'camera';
+  let trackerLoadTimer;
   try {
     if (!navigator.mediaDevices?.getUserMedia) throw new Error('secure-context');
     const active = await navigator.mediaDevices.getUserMedia({
@@ -221,30 +224,46 @@ toggle.onclick = async () => {
     video.hidden = false;
     stage.classList.add('live');
     step = 'tracker';
-    toggle.textContent = '正在加载…';
-    const [{ FaceLandmarker }, { createTracker }] = await Promise.all([
-      import('@mediapipe/tasks-vision'), import('../src/faceTracking.ts'),
-    ]);
+    toggle.textContent = '取消加载';
+    toggle.disabled = false;
+    hint.textContent = '正在加载表情模型…';
+    const initializeTracker = async () => {
+      const [{ FaceLandmarker }, { createTracker }] = await Promise.all([
+        import('@mediapipe/tasks-vision'), import('../src/faceTracking.ts'),
+      ]);
+      if (attempt !== cameraAttempt) return;
+      const loadedTracker = await createTracker(true, referenceLook);
+      if (attempt !== cameraAttempt) {
+        loadedTracker.close();
+        return;
+      }
+      return { FaceLandmarker, loadedTracker };
+    };
+    const timeout = new Promise((_, reject) => {
+      trackerLoadTimer = setTimeout(() => reject(new Error('tracker-timeout')), trackerLoadTimeoutMs);
+    });
+    const initialized = await Promise.race([initializeTracker(), timeout]);
     if (attempt !== cameraAttempt) return;
-    const loadedTracker = await createTracker(true, referenceLook);
-    if (attempt !== cameraAttempt) {
-      loadedTracker.close();
-      return;
-    }
+    const { FaceLandmarker, loadedTracker } = initialized;
     tracker = loadedTracker;
     ovalIndices = [...new Set((FaceLandmarker.FACE_LANDMARKS_FACE_OVAL ?? [])
       .flatMap(({ start, end }) => [start, end]))];
     startRendering();
     toggle.textContent = '关闭相机';
+    hint.textContent = '';
   } catch (error) {
     if (attempt !== cameraAttempt) return;
     console.error(error);
     stop();
-    hint.textContent = step === 'tracker' ? '本地表情模型或 WASM 加载失败。请通过项目服务器打开，并检查模型和构建资源是否完整。'
+    hint.textContent = error.message === 'tracker-timeout' ? '表情模型加载超时。请检查网络后点击「开启相机」重试。'
+      : step === 'tracker' ? '表情模型或 WASM 加载失败。请刷新页面后重试。'
       : error.name === 'NotAllowedError' ? '请在浏览器中允许相机权限后重试。'
       : error.message === 'secure-context' ? '请通过 HTTPS 或 localhost 打开。'
       : '无法开启相机，请检查连接或关闭占用相机的应用。';
-  } finally { toggle.disabled = false; }
+  } finally {
+    clearTimeout(trackerLoadTimer);
+    if (attempt === cameraAttempt) toggle.disabled = false;
+  }
 };
 
 function updateHeadGestures(now, matrix) {
